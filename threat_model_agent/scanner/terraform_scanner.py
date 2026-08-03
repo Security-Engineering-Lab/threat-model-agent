@@ -59,6 +59,24 @@ INTERESTING_ATTRS = [
     "administrator_login",
 ]
 
+# Attrs relevant to role/permission scoping — only meaningful for
+# azurerm_role_assignment / azurerm_key_vault_access_policy resources, so
+# pulled separately to avoid noise on every other resource type.
+ROLE_ATTRS = [
+    "scope",
+    "role_definition_name",
+    "role_definition_id",
+    "principal_id",
+]
+
+KEY_VAULT_POLICY_LIST_ATTRS = [
+    "secret_permissions",
+    "key_permissions",
+    "certificate_permissions",
+]
+
+ROLE_SCOPED_RESOURCE_TYPES = {"azurerm_role_assignment", "azurerm_key_vault_access_policy"}
+
 
 def _extract_attrs(body: str) -> Dict[str, str]:
     attrs = {}
@@ -73,6 +91,20 @@ def _extract_attrs(body: str) -> Dict[str, str]:
     return attrs
 
 
+def _extract_role_attrs(body: str) -> Dict[str, str]:
+    attrs = {}
+    for key in ROLE_ATTRS:
+        m = re.search(ATTR_RE_TEMPLATE.format(attr=re.escape(key)), body)
+        if m:
+            attrs[key] = m.group(1).strip()
+    for key in KEY_VAULT_POLICY_LIST_ATTRS:
+        m = re.search(rf'{key}\s*=\s*\[([^\]]*)\]', body, re.DOTALL)
+        if m:
+            values = re.findall(r'"([^"]+)"', m.group(1))
+            attrs[key] = ", ".join(values)
+    return attrs
+
+
 def scan_terraform_directory(root: Path) -> List[TerraformResource]:
     """Recursively scans all .tf files under root and returns every
     resource block found, with a few interesting attributes extracted."""
@@ -84,13 +116,20 @@ def scan_terraform_directory(root: Path) -> List[TerraformResource]:
         for m in RESOURCE_RE.finditer(text):
             rtype, rname = m.group(1), m.group(2)
             body = _extract_block(text, m.end())
+
+            if rtype in ROLE_SCOPED_RESOURCE_TYPES:
+                attrs = _extract_role_attrs(body)
+            else:
+                attrs = _extract_attrs(body)
+
             resources.append(
                 TerraformResource(
                     type=rtype,
                     name=rname,
                     file=str(tf_file.relative_to(root)),
                     body=body,
-                    attrs=_extract_attrs(body),
+                    attrs=attrs,
                 )
             )
     return resources
+

@@ -5,10 +5,10 @@ writes it out as YAML, ready for stride_engine.analyze().
 Design note: this is intentionally heuristic, not a full Terraform graph
 evaluator. It recognizes a fixed set of common Azure resource types,
 infers data flows from private_endpoint / delegated_subnet_id /
-diagnostic_setting resources, and — usefully — flags datastore-type
-resources that have NO diagnostic_setting flow pointing at a logging
-sink, since "we deployed it but never wired up its logs" is exactly the
-kind of real gap this tool should surface rather than paper over.
+diagnostic_setting resources, flags datastore-type resources that have NO
+diagnostic_setting flow pointing at a logging sink, and flags role
+assignments / Key Vault access policies that look broader than a
+least-privilege application identity would need.
 """
 import re
 from pathlib import Path
@@ -39,6 +39,12 @@ PRIMARY_PROCESS_TYPES = {"azurerm_linux_web_app", "azurerm_windows_web_app", "az
 LOG_SINK_IDS = {"log_analytics", "sentinel", "app_insights"}
 
 RESOURCE_ADDR_RE = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z0-9_\-]+)\.id")
+
+# Roles broad enough to warrant a flag when granted via azurerm_role_assignment.
+BROAD_ROLE_NAMES = {"Contributor", "Owner", "Key Vault Administrator"}
+
+# Key Vault secret permission sets broader than a typical read-only app identity needs.
+BROAD_KV_SECRET_PERMS = {"get", "set", "delete"}
 
 
 def _friendly_id(resource: TerraformResource, used_ids: Dict[str, int]) -> Optional[str]:
@@ -98,6 +104,44 @@ def _find_primary_process(components: List[dict]) -> Optional[dict]:
         if c["_resource"].type in PRIMARY_PROCESS_TYPES:
             return c
     return None
+
+
+def _flag_broad_privileges(resources: List[TerraformResource], components: List[dict]) -> None:
+    """Cross-references azurerm_role_assignment / azurerm_key_vault_access_policy
+    resources against mapped components and annotates any that look broader
+    than a least-privilege application identity would need. Matching is a
+    best-effort keyword match against the resource's `scope` attribute, since
+    scope is usually a resource-id-style reference (possibly interpolated)."""
+    comp_by_keyword = {c["id"].split("_")[0]: c for c in components if "_resource" in c}
+
+    for r in resources:
+        if r.type == "azurerm_role_assignment":
+            role_name = r.attr("role_definition_name") or ""
+            scope = (r.attr("scope") or "").lower()
+            if role_name in BROAD_ROLE_NAMES:
+                target = next((c for kw, c in comp_by_keyword.items() if kw and kw in scope), None)
+                note = (
+                    f" ⚠ Terraform grants the broad role '{role_name}' via "
+                    f"`{r.type}.{r.name}` — consider a narrower, resource-specific "
+                    f"built-in role scoped to only what the app identity needs."
+                )
+                if target:
+                    target["description"] += note
+                # else: broad role with an unresolvable/dynamic scope — surfaced
+                # in the printed scan summary instead, see build_system_model_dict.
+
+        elif r.type == "azurerm_key_vault_access_policy":
+            secret_perms = {
+                p.strip().lower() for p in (r.attr("secret_permissions") or "").split(",") if p.strip()
+            }
+            if secret_perms and secret_perms.issuperset(BROAD_KV_SECRET_PERMS):
+                kv = next((c for c in components if c["id"] == "key_vault"), None)
+                if kv:
+                    kv["description"] += (
+                        f" ⚠ `{r.type}.{r.name}` grants broad secret permissions "
+                        f"({', '.join(sorted(secret_perms))}) — a read-only application "
+                        f"identity typically only needs 'get' and 'list'."
+                    )
 
 
 def _build_flows(resources: List[TerraformResource], components: List[dict], resource_lookup: Dict[tuple, str]):
@@ -172,15 +216,8 @@ def _build_flows(resources: List[TerraformResource], components: List[dict], res
                 matched_source = c
                 break
         if not matched_source and "subscription" in (r.attr("target_resource_id") or ""):
-            # Subscription-level activity log (e.g. an Azure Activity Log
-            # diagnostic setting) isn't a single component — represent it as
-            # a synthetic external source rather than misattributing it to
-            # another already-mapped component.
             matched_source = {"id": "azure_activity_log", "_synthetic_name": "Azure Activity Log"}
         elif matched_source and matched_source["id"] in LOG_SINK_IDS:
-            # A log-sink resource matching its own keyword (e.g. a diagnostic
-            # setting literally named "sentinel-activity") isn't a real
-            # source -> sink flow; skip rather than create a confusing loop.
             matched_source = None
 
         if matched_source:
@@ -209,8 +246,7 @@ def _build_flows(resources: List[TerraformResource], components: List[dict], res
                 }
             )
 
-    # 4) Flag datastore components with no outbound logging flow — a real,
-    # useful gap to surface rather than silently ignore.
+    # 4) Flag datastore components with no outbound logging flow.
     for c in components:
         if c["type"] == "datastore" and c["id"] not in logged_component_ids:
             c["description"] += (
@@ -229,12 +265,12 @@ def build_system_model_dict(
     repo_root = Path(repo_root)
     resources = scan_terraform_directory(repo_root)
     components, resource_lookup = _build_components(resources)
+    _flag_broad_privileges(resources, components)
 
     settings_path, urls_paths = find_django_files(repo_root)
     django_result = scan_settings(settings_path) if settings_path else None
     url_prefixes = scan_urls(urls_paths) if urls_paths else []
 
-    # Always add an end-user actor.
     output_components = [
         {
             "id": "user",
@@ -246,7 +282,6 @@ def build_system_model_dict(
         }
     ]
 
-    # Surface detected auth backends as an external identity provider.
     if django_result and any("EntraID" in b or "entra" in b.lower() for b in django_result.auth_backends):
         output_components.append(
             {
@@ -261,7 +296,6 @@ def build_system_model_dict(
 
     flows, synthetic_components = _build_flows(resources, components, resource_lookup)
 
-    # Strip internal helper key before emitting.
     clean_components = [{k: v for k, v in c.items() if k != "_resource"} for c in components]
     clean_components.extend(synthetic_components)
 

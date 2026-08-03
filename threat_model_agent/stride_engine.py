@@ -118,28 +118,60 @@ class ThreatModelingEngine:
                 note = f"(removed unverified technique IDs: {', '.join(invalid_ids)})"
                 threat["mitigation"] = (threat.get("mitigation", "") + " " + note).strip()
 
-    def analyze(self, system: SystemModel, max_tokens: int = 4096) -> Dict[str, Any]:
+    def _call_model(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+        """Single API call, returns raw text. Raises on truncation."""
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
-            system=self._build_system_prompt(),
-            messages=[{"role": "user", "content": self._build_user_prompt(system)}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
         )
 
-        text = "".join(block.text for block in response.content if block.type == "text").strip()
+        if response.stop_reason == "max_tokens":
+            raise RuntimeError(
+                f"Response was truncated at max_tokens={max_tokens} before completing. "
+                "Increase max_tokens (the system likely has too many components/flows "
+                "for the current limit) and retry."
+            )
 
+        return "".join(block.text for block in response.content if block.type == "text").strip()
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
                 text = text[4:]
             text = text.strip()
+        return text
+
+    def analyze(self, system: SystemModel, max_tokens: int = 8192) -> Dict[str, Any]:
+        system_prompt = self._build_system_prompt()
+        user_prompt = self._build_user_prompt(system)
+
+        text = self._strip_fences(self._call_model(system_prompt, user_prompt, max_tokens))
 
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Model did not return valid JSON. Raw response:\n{text}"
-            ) from exc
+            # One repair attempt: show the model its own broken output and the
+            # parser error, ask for a corrected JSON-only response.
+            repair_prompt = (
+                f"Your previous response was not valid JSON. Parser error:\n{exc}\n\n"
+                f"Your previous response was:\n{text}\n\n"
+                "Return ONLY the corrected, valid JSON matching the original schema. "
+                "No markdown fences, no prose."
+            )
+            try:
+                repaired_text = self._strip_fences(
+                    self._call_model(system_prompt, repair_prompt, max_tokens)
+                )
+                data = json.loads(repaired_text)
+            except (json.JSONDecodeError, RuntimeError) as repair_exc:
+                raise ValueError(
+                    f"Model did not return valid JSON, and the repair attempt also "
+                    f"failed: {repair_exc}\nOriginal raw response:\n{text}"
+                ) from repair_exc
 
         self._validate_and_enrich(data)
         return data
