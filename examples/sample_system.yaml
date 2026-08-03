@@ -1,0 +1,101 @@
+name: Django Azure Security Template
+description: >
+  Django 6 web application deployed on Azure App Service, with VNet-integrated
+  access to a private PostgreSQL Flexible Server and Key Vault, fronted by
+  Entra External ID CIAM and Google OAuth2 for authentication.
+
+components:
+  - id: user
+    name: End User
+    type: actor
+    trust_zone: internet
+    description: Authenticates via browser over HTTPS.
+
+  - id: entra_ciam
+    name: Entra External ID CIAM
+    type: external_entity
+    trust_zone: internet
+    technologies: ["Microsoft Entra External ID", "MSAL", "Google OAuth2"]
+    description: Identity provider handling login and token issuance.
+
+  - id: app_service
+    name: Django App Service
+    type: process
+    trust_zone: dmz
+    technologies: ["Django 6", "Python 3.12", "Gunicorn", "HTMX"]
+    description: >
+      Main web application. VNet-integrated, System-Assigned Managed Identity,
+      handles auth callbacks, business logic, and dashboard views.
+
+  - id: key_vault
+    name: Azure Key Vault
+    type: datastore
+    trust_zone: restricted
+    technologies: ["Azure Key Vault", "Private Endpoint"]
+    description: Stores DB password, Django SECRET_KEY, OAuth client secret.
+
+  - id: postgres
+    name: PostgreSQL Flexible Server
+    type: datastore
+    trust_zone: restricted
+    technologies: ["Azure PostgreSQL Flexible Server", "Private Endpoint"]
+    description: Primary application database, currently accessed via a broad-privilege DB role.
+
+  - id: sentinel
+    name: Microsoft Sentinel
+    type: process
+    trust_zone: internal
+    technologies: ["Log Analytics", "Sentinel Analytics Rules"]
+    description: Collects logs, runs detections (brute force, device anomalies).
+
+data_flows:
+  - id: flow_login
+    source: user
+    destination: entra_ciam
+    protocol: HTTPS/OIDC
+    data_classification: confidential
+    crosses_trust_boundary: true
+    description: User credentials / OAuth redirect flow.
+
+  - id: flow_token
+    source: entra_ciam
+    destination: app_service
+    protocol: HTTPS/OIDC
+    data_classification: confidential
+    crosses_trust_boundary: true
+    description: ID token / access token returned after authentication.
+
+  - id: flow_secrets
+    source: app_service
+    destination: key_vault
+    protocol: HTTPS (Private Endpoint)
+    data_classification: restricted
+    crosses_trust_boundary: true
+    description: App fetches DB password, SECRET_KEY, OAuth secret via Managed Identity.
+
+  - id: flow_db
+    source: app_service
+    destination: postgres
+    protocol: PostgreSQL over Private Endpoint
+    data_classification: confidential
+    crosses_trust_boundary: true
+    description: >
+      App connects to the database currently as a high-privilege role
+      rather than a least-privilege application-specific role.
+
+  - id: flow_logs
+    source: app_service
+    destination: sentinel
+    protocol: HTTPS (diagnostic settings / OpenTelemetry)
+    data_classification: internal
+    crosses_trust_boundary: false
+    description: Application traces, HTTP logs, and auth events shipped for detection.
+
+trust_boundaries:
+  - id: tb_internet_dmz
+    name: Internet / DMZ boundary
+    description: Public internet to App Service edge (HTTPS only, NSG deny-all otherwise).
+
+  - id: tb_dmz_restricted
+    name: DMZ / Restricted data boundary
+    description: App subnet to Key Vault / PostgreSQL private endpoints.

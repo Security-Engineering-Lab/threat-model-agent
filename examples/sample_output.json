@@ -1,0 +1,71 @@
+{
+  "executive_summary": "The overall posture is reasonable: authentication is delegated to Entra External ID CIAM, secrets live in Key Vault, and traffic to data stores runs over private endpoints with Managed Identity. The most significant gap is the PostgreSQL data flow, which currently uses a broad-privilege role instead of a least-privilege application account, giving an attacker who compromises the App Service far more database access than the app actually needs. Secondary risks involve brute-force pressure on the login flow and the lack of network-layer restrictions (WAF/IP allow-listing) in front of the App Service.",
+  "threats": [
+    {
+      "id": "T-001",
+      "target_component_or_flow": "flow_db",
+      "stride_category": "Elevation of Privilege",
+      "title": "Application connects to PostgreSQL with excessive database privileges",
+      "description": "The Django app authenticates to PostgreSQL as a high-privilege role rather than a scoped, least-privilege application role. If the App Service is compromised (e.g. via a code vulnerability), the attacker inherits far more database capability than the application requires, including potential access to other schemas or administrative functions.",
+      "attack_techniques": ["T1078", "T1078.004"],
+      "likelihood": "Medium",
+      "impact": "High",
+      "mitigation": "Create a dedicated least-privilege PostgreSQL role scoped to CONNECT/SELECT/INSERT/UPDATE/DELETE on the application schema only; use a separate, more-privileged migration role solely for CI/CD schema migrations."
+    },
+    {
+      "id": "T-002",
+      "target_component_or_flow": "flow_login",
+      "stride_category": "Spoofing",
+      "title": "Credential brute-forcing / credential stuffing against the login flow",
+      "description": "The login flow accepts username/password style credentials from the public internet. Without rate limiting or account lockout, an attacker can attempt brute-force or credential-stuffing attacks against user accounts.",
+      "attack_techniques": ["T1110", "T1110.004"],
+      "likelihood": "High",
+      "impact": "Medium",
+      "mitigation": "Enforce Smart Lockout / rate limiting at the CIAM layer, add a Sentinel analytics rule for distributed low-and-slow password spray (many IPs, low attempts each), and require MFA for all accounts."
+    },
+    {
+      "id": "T-003",
+      "target_component_or_flow": "app_service",
+      "stride_category": "Denial of Service",
+      "title": "No network-layer restrictions (WAF/IP allow-listing) in front of App Service",
+      "description": "The App Service is directly reachable over the internet with only NSG-level allow/deny rules. There is no Web Application Firewall or IP restriction layer, leaving the app exposed to volumetric requests, scanning, and common web attack patterns (SQLi, XSS) without an additional filtering layer.",
+      "attack_techniques": ["T1595", "T1498"],
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "Deploy Application Gateway v2 with WAF (or Azure Front Door WAF if multi-region becomes a requirement) in front of the App Service, and restrict direct App Service ingress to the gateway's subnet."
+    },
+    {
+      "id": "T-004",
+      "target_component_or_flow": "flow_secrets",
+      "stride_category": "Information Disclosure",
+      "title": "Secrets potentially exposed via CLI output during operational tasks",
+      "description": "Operational commands that set App Service configuration (e.g. connection strings, client secrets) can print all app settings in plaintext to the console/logs if invoked without output suppression, risking secret leakage into CI logs or terminal history.",
+      "attack_techniques": ["T1552", "T1552.001"],
+      "likelihood": "Medium",
+      "impact": "High",
+      "mitigation": "Always use output-suppressing flags on CLI commands that touch app settings, restrict who can view pipeline logs, and rotate any secret that was printed even once."
+    },
+    {
+      "id": "T-005",
+      "target_component_or_flow": "flow_token",
+      "stride_category": "Tampering",
+      "title": "Token replay or theft in transit between CIAM and App Service",
+      "description": "OIDC tokens returned from Entra External ID CIAM cross a trust boundary over the public internet. If TLS were misconfigured or a token were leaked (e.g. via referrer headers or logs), an attacker could replay it to impersonate the user.",
+      "attack_techniques": ["T1528", "T1557"],
+      "likelihood": "Low",
+      "impact": "High",
+      "mitigation": "Enforce short token lifetimes, validate audience/issuer/nonce on every request, ensure HSTS and TLS 1.2+ only, and avoid logging full Authorization headers."
+    },
+    {
+      "id": "T-006",
+      "target_component_or_flow": "sentinel",
+      "stride_category": "Repudiation",
+      "title": "Gaps in centralized logging reduce forensic traceability",
+      "description": "Not all data-plane operations (e.g. direct Key Vault or PostgreSQL access) may be consistently captured in Sentinel, which could leave gaps in the audit trail needed to reconstruct an incident timeline.",
+      "attack_techniques": ["T1027"],
+      "likelihood": "Low",
+      "impact": "Medium",
+      "mitigation": "Ensure diagnostic settings are enabled and formalized in IaC for every data-plane resource (Key Vault AuditEvent, PostgreSQL session logs), routed consistently to the same Log Analytics workspace."
+    }
+  ]
+}
