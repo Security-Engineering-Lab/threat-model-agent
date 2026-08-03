@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 patch_backups/
+examples/scanned_system.yaml
+report.md
