@@ -145,7 +145,7 @@ class ThreatModelingEngine:
             text = text.strip()
         return text
 
-    def analyze(self, system: SystemModel, max_tokens: int = 8192) -> Dict[str, Any]:
+    def analyze(self, system: SystemModel, max_tokens: int = 16000) -> Dict[str, Any]:
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(system)
 

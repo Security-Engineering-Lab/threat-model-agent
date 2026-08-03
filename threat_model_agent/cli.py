@@ -28,6 +28,9 @@ def main() -> int:
         "--model", default="claude-sonnet-5", help="Claude model to use (default: claude-sonnet-5)"
     )
     parser.add_argument(
+        "--max-tokens", type=int, default=16000, help="Max tokens for the Claude analysis response (default: 16000)"
+    )
+    parser.add_argument(
         "--offline-demo",
         action="store_true",
         help="Skip the API call and use the bundled example analysis (no API key needed, for demos)",
@@ -49,7 +52,7 @@ def main() -> int:
     else:
         try:
             engine = ThreatModelingEngine(model=args.model, attack_mapper=attack_mapper)
-            analysis = engine.analyze(system)
+            analysis = engine.analyze(system, max_tokens=args.max_tokens)
         except Exception as exc:
             print(f"Error during analysis: {exc}", file=sys.stderr)
             return 1
