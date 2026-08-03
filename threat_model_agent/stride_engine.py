@@ -108,15 +108,33 @@ class ThreatModelingEngine:
 
         return "\n".join(lines)
 
-    def _validate_and_enrich(self, data: Dict[str, Any]) -> None:
+    def _validate_and_enrich(self, data: Dict[str, Any], system: SystemModel) -> None:
+        """The gate: never trust the model's own claims about what a threat
+        targets or which ATT&CK techniques apply. Verify both against the
+        actual input before the report is generated."""
+        valid_target_ids = {c.id for c in system.components} | {f.id for f in system.data_flows}
+
         for threat in data.get("threats", []):
             technique_ids = threat.get("attack_techniques", []) or []
             valid_ids = [t for t in technique_ids if self.attack_mapper.is_valid(t)]
             invalid_ids = [t for t in technique_ids if t not in valid_ids]
             threat["attack_techniques"] = valid_ids
+
+            notes = []
             if invalid_ids:
-                note = f"(removed unverified technique IDs: {', '.join(invalid_ids)})"
-                threat["mitigation"] = (threat.get("mitigation", "") + " " + note).strip()
+                notes.append(f"removed unverified technique IDs: {', '.join(invalid_ids)}")
+
+            target = threat.get("target_component_or_flow", "")
+            if target not in valid_target_ids:
+                notes.append(
+                    f"\u26a0 target '{target}' does not match any known component/flow ID "
+                    "in the input system model \u2014 verify this threat manually"
+                )
+
+            if notes:
+                threat["mitigation"] = (
+                    threat.get("mitigation", "") + " (" + "; ".join(notes) + ")"
+                ).strip()
 
     def _call_model(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
         """Single API call, returns raw text. Raises on truncation."""
@@ -173,5 +191,5 @@ class ThreatModelingEngine:
                     f"failed: {repair_exc}\nOriginal raw response:\n{text}"
                 ) from repair_exc
 
-        self._validate_and_enrich(data)
+        self._validate_and_enrich(data, system)
         return data
